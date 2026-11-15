@@ -1,5 +1,7 @@
 # Gateway de inferencia
 
+[![ci](https://github.com/frankirova/ia-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/frankirova/ia-gateway/actions/workflows/ci.yml)
+
 Un gateway pequeño y agnóstico de tareas que es dueño del acceso al modelo
 llama.cpp local del homelab. Las aplicaciones se autentican con su propia clave
 bearer, piden un alias de modelo público y reciben una única respuesta, sin
