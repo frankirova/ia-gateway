@@ -1,0 +1,61 @@
+{
+  "name": "vps-report",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "c41a7e08-5f36-4b92-9d70-2e8b3a6f1d11",
+      "name": "Every 6 hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "authentication": "privateKey",
+        "resource": "command",
+        "operation": "execute",
+        "command": "vps-report-run",
+        "cwd": "/"
+      },
+      "id": "6f0d93b4-8a17-4c5e-b2a9-7d31c8405e22",
+      "name": "Run vps report",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [220, 0],
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "vps-report"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 6 hours": {
+      "main": [
+        [
+          {
+            "node": "Run vps report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Argentina/Buenos_Aires"
+  },
+  "pinData": {}
+}

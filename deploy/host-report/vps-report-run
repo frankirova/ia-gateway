@@ -1,0 +1,57 @@
+#!/bin/sh
+# The only thing the vps-report key may run, whatever command it asks for.
+#
+# This is the forced command of the n8n vps-report key, installed on the server
+# that collects the report. It ignores SSH_ORIGINAL_COMMAND on purpose: the
+# client chooses nothing, not the window, not the recipient and not the
+# deduplication key. Everything that varies comes from the environment file or
+# from the clock.
+#
+# Sourcing this file only defines the functions, so the tests can exercise
+# them without starting a report.
+set -eu
+
+ENV_FILE=${HOST_REPORT_ENV_FILE:-/etc/host-report/vps.env}
+REPORT_ROOT=${HOST_REPORT_ROOT:-/opt/host-report/current}
+WINDOW=${HOST_REPORT_WINDOW:-6h}
+SLOT_HOURS=${HOST_REPORT_SLOT_HOURS:-6}
+
+#: The schedule repeats every six hours, so the slot is the six-hour block of
+#: the UTC day. A retry of the same run reuses the same key and the hub answers
+#: duplicate instead of sending the report twice; a run in another block is a
+#: different report and must send. The hub claims the key before it calls WAHA,
+#: so no local state is needed.
+#:
+#: The host label comes from HOST_REPORT_HOST, never from hostname: this wrapper
+#: runs on the collecting server, so the local host name is the wrong answer for
+#: a report about the VPS.
+slot_key() {
+	slot_day=$(date -u +%Y-%m-%d)
+	slot_hour=$(date -u +%H)
+	# Portable leading-zero strip: dash has no ``10#`` arithmetic prefix.
+	slot_hour=${slot_hour#0}
+	: "${slot_hour:=0}"
+	printf 'vps-report:%s:%sT%02d\n' \
+		"${HOST_REPORT_HOST:-vps}" "$slot_day" "$((slot_hour / SLOT_HOURS * SLOT_HOURS))"
+}
+
+load_environment() {
+	if [ -r "$ENV_FILE" ]; then
+		set -a
+		# shellcheck disable=SC1090
+		. "$ENV_FILE"
+		set +a
+	fi
+}
+
+run_report() {
+	load_environment
+	: "${HOST_REPORT_NOTIFY_KEY:=$(slot_key)}"
+	export HOST_REPORT_NOTIFY_KEY
+	cd "$REPORT_ROOT"
+	exec python3 -m tasks.host_report --since "$WINDOW" --report markdown --notify hub
+}
+
+if [ "$(basename -- "$0")" = "vps-report-run" ]; then
+	run_report
+fi

@@ -1,0 +1,21 @@
+{
+  "upstream": {
+    "base_url": "http://127.0.0.1:8190",
+    "model": "gemma-4-E4B-it-UD-Q4_K_XL",
+    "connect_timeout": 3,
+    "read_timeout": 120
+  },
+  "limits": {
+    "context_char_budget": 16000
+  },
+  "applications": [
+    {
+      "id": "example-application",
+      "key_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "models": ["e4b"],
+      "max_output_tokens": 512,
+      "rate_capacity": 10,
+      "rate_per_minute": 10
+    }
+  ]
+}

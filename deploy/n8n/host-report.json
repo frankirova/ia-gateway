@@ -1,0 +1,61 @@
+{
+  "name": "host-report",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "3d5c1f60-2a44-4c19-9a1e-6a0f1a2b7c01",
+      "name": "Every 6 hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "authentication": "privateKey",
+        "resource": "command",
+        "operation": "execute",
+        "command": "host-report-run",
+        "cwd": "/"
+      },
+      "id": "9b7e2c31-1d58-4f0d-8c22-5d9f0e4a8b02",
+      "name": "Run host report",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [220, 0],
+      "credentials": {
+        "sshPrivateKey": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "host-report"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 6 hours": {
+      "main": [
+        [
+          {
+            "node": "Run host report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Argentina/Buenos_Aires"
+  },
+  "pinData": {}
+}

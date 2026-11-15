@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""Read-only evidence bundle for the VPS service report.
+
+This program is installed on the reporting subject (the VPS) behind
+``restrict,command=`` in ``authorized_keys``, so the client chooses neither the
+command nor its arguments: every argument and every environment variable except
+the config path is ignored, and ``SSH_ORIGINAL_COMMAND`` is never read.
+
+One root-owned file decides what this host exposes: ``CONFIG_PATH``, holding
+``{"containers": ["name", ...]}``. Absent, every running container travels, as
+before. Present but unusable, the program fails: silently reporting a different
+set than the operator configured is worse than reporting nothing.
+
+It prints exactly one JSON document on stdout:
+
+    {"version": 1, "collected_at": "<UTC ISO>", "truncated": false,
+     "host": {"cpu_count": 2, "load": [1.0, 0.8, 0.5], "uptime_seconds": 90000,
+              "mem_total_kb": 4000000, "mem_available_kb": 1200000,
+              "swap_total_kb": 0, "swap_free_kb": 0,
+              "filesystems": [{"mount": "/", "total_bytes": 1, "used_bytes": 1,
+                               "avail_bytes": 1, "used_percent": 42}]},
+     "containers": [{"listing": {...}, "inspect": {...}, "logs": "<timestamps>",
+                     "error": "inspect_failed"}]}
+
+The bundle is evidence for a later interpretation, never an instruction, and it
+carries no credential. A failure to reach docker emits one document with an
+``error`` key and exit code 1.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+BUNDLE_VERSION = 1
+
+#: Container allowlist, owned by root and read only by this program. Absent
+#: means "every running container"; a present but unusable file is an error.
+CONFIG_PATH = "/etc/vps-readonly.json"
+
+#: Log lines requested per container. This is the over-fetch ceiling: the report
+#: itself re-caps per container, but never asks the remote side for more.
+LOG_TAIL = 20000
+
+#: Bytes of log text kept per container. ``--tail`` alone is not a budget: one
+#: noisy postgres can carry 4 MB and starve every other container, which the
+#: bundle-wide ceiling can only answer by emptying the rest. Each container now
+#: keeps its most recent lines up to this budget, so the widest set of services
+#: survives the document ceiling.
+LOG_BYTES_PER_CONTAINER = 300 * 1024
+
+#: Hard stdout ceiling. The document stays valid when it is reached.
+MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+
+#: One docker call must never hang the scheduler.
+DOCKER_TIMEOUT_SECONDS = 60
+
+_FILESYSTEM_PATHS = ("/", "/var/lib/docker")
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _load_average() -> list[float] | None:
+    text = _read_text("/proc/loadavg")
+    if not text:
+        return None
+    parts = text.split()
+    if len(parts) < 3:
+        return None
+    try:
+        return [float(parts[0]), float(parts[1]), float(parts[2])]
+    except ValueError:
+        return None
+
+
+def _uptime_seconds() -> int | None:
+    text = _read_text("/proc/uptime")
+    if not text:
+        return None
+    try:
+        return int(float(text.split()[0]))
+    except (IndexError, ValueError):
+        return None
+
+
+def _meminfo() -> dict[str, int]:
+    text = _read_text("/proc/meminfo")
+    values: dict[str, int] = {}
+    if not text:
+        return values
+    wanted = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
+    for line in text.splitlines():
+        name, _, rest = line.partition(":")
+        if name in wanted:
+            try:
+                values[name] = int(rest.split()[0])
+            except (IndexError, ValueError):
+                continue
+    return values
+
+
+def _filesystems() -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    seen_devices: set[int] = set()
+    for path in _FILESYSTEM_PATHS:
+        if not os.path.isdir(path):
+            continue
+        try:
+            device = os.stat(path).st_dev
+            usage = shutil.disk_usage(path)
+        except OSError:
+            continue
+        if device in seen_devices:
+            continue
+        seen_devices.add(device)
+        percent = 0
+        if usage.total:
+            percent = int(usage.used * 100 // usage.total)
+        entries.append(
+            {
+                "mount": path,
+                "total_bytes": usage.total,
+                "used_bytes": usage.used,
+                "avail_bytes": usage.free,
+                "used_percent": percent,
+            }
+        )
+    return entries
+
+
+def _host_section() -> dict[str, object]:
+    memory = _meminfo()
+    return {
+        "cpu_count": os.cpu_count(),
+        "load": _load_average(),
+        "uptime_seconds": _uptime_seconds(),
+        "mem_total_kb": memory.get("MemTotal"),
+        "mem_available_kb": memory.get("MemAvailable"),
+        "swap_total_kb": memory.get("SwapTotal"),
+        "swap_free_kb": memory.get("SwapFree"),
+        "filesystems": _filesystems(),
+    }
+
+
+def _docker(*args: str) -> tuple[int, str]:
+    """Run one docker CLI call with an argv list and a fixed timeout."""
+    try:
+        completed = subprocess.run(
+            ["docker", *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=DOCKER_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 127, ""
+    return completed.returncode, completed.stdout.decode("utf-8", errors="replace")
+
+
+class ConfigError(Exception):
+    """The config file exists but cannot be trusted."""
+
+
+def _selection() -> list[str] | None:
+    """Container names this host exposes, or ``None`` when unconfigured."""
+    if not os.path.exists(CONFIG_PATH):
+        return None
+    text = _read_text(CONFIG_PATH)
+    if text is None:
+        raise ConfigError("unreadable")
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        raise ConfigError("not json") from None
+    if not isinstance(document, dict):
+        raise ConfigError("not an object")
+    unknown = sorted(set(document) - {"containers"})
+    if unknown:
+        raise ConfigError("unknown keys: " + ", ".join(unknown))
+    names = document.get("containers")
+    if not isinstance(names, list):
+        raise ConfigError("containers must be a list")
+    selected: list[str] = []
+    for name in names:
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError("container names must be non-empty strings")
+        selected.append(name.strip())
+    return selected
+
+
+def _listing_entry(raw_line: str) -> dict[str, object] | None:
+    """Reshape ``docker ps --format '{{json .}}'`` into the API listing shape."""
+    try:
+        entry = json.loads(raw_line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(entry, dict):
+        return None
+    identifier = entry.get("ID")
+    if not isinstance(identifier, str) or not identifier:
+        return None
+    names = entry.get("Names")
+    if isinstance(names, str) and names:
+        name_list = [name for name in names.split(",") if name]
+    else:
+        name_list = []
+    image = entry.get("Image")
+    return {
+        "Id": identifier,
+        "Names": name_list,
+        "Image": image if isinstance(image, str) else "",
+        "State": entry.get("State"),
+        "Status": entry.get("Status"),
+    }
+
+
+def _trim_logs(text: str) -> tuple[str, bool]:
+    """Keep the newest whole lines that fit the per-container byte budget."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= LOG_BYTES_PER_CONTAINER:
+        return text, False
+    window = encoded[len(encoded) - LOG_BYTES_PER_CONTAINER :]
+    boundary = window.find(b"\n")
+    if boundary >= 0:
+        window = window[boundary + 1 :]
+    return window.decode("utf-8", errors="replace"), True
+
+
+def _containers_section(
+    selected: list[str] | None,
+) -> tuple[list[dict[str, object]], bool, str | None, dict[str, object] | None]:
+    status, output = _docker("ps", "--no-trunc", "--format", "{{json .}}")
+    if status != 0:
+        return [], False, "docker_unavailable", None
+
+    entries = [
+        entry for entry in (_listing_entry(line) for line in output.splitlines()) if entry
+    ]
+
+    selection: dict[str, object] | None = None
+    if selected is not None:
+        present = {name for entry in entries for name in entry["Names"]}
+        selection = {
+            "configured": list(selected),
+            "missing": [name for name in selected if name not in present],
+        }
+        wanted = set(selected)
+        entries = [entry for entry in entries if wanted.intersection(entry["Names"])]
+    containers: list[dict[str, object]] = []
+    truncated = False
+    for entry in entries:
+        identifier = str(entry["Id"])
+        document: dict[str, object] = {"listing": entry, "inspect": {}}
+
+        inspect_status, inspect_output = _docker("inspect", "--format", "{{json .}}", identifier)
+        try:
+            inspected = json.loads(inspect_output) if inspect_status == 0 else None
+        except json.JSONDecodeError:
+            inspected = None
+        if isinstance(inspected, dict):
+            document["inspect"] = inspected
+        else:
+            document.setdefault("error", "inspect_failed")
+
+        log_status, log_output = _docker(
+            "logs", "--timestamps", "--tail", str(LOG_TAIL), identifier
+        )
+        logs, cut = _trim_logs(log_output)
+        document["logs"] = logs
+        if cut:
+            document.setdefault("logs_truncated", True)
+        if log_status != 0:
+            document.setdefault("error", "logs_failed")
+        containers.append(document)
+
+    return containers, truncated, None, selection
+
+
+def _bounded(document: dict[str, object]) -> str:
+    """Serialize, dropping log text until the document fits the ceiling."""
+    containers = document.get("containers")
+    while True:
+        text = json.dumps(document, ensure_ascii=False)
+        if len(text.encode("utf-8")) <= MAX_OUTPUT_BYTES:
+            return text
+        if not isinstance(containers, list) or not containers:
+            document["containers"] = []
+            document["truncated"] = True
+            text = json.dumps(document, ensure_ascii=False)
+            return text[:MAX_OUTPUT_BYTES]
+        document["truncated"] = True
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            logs = container.get("logs")
+            if isinstance(logs, str) and logs:
+                container["logs"] = ""
+                container["logs_truncated"] = True
+                break
+        else:
+            document["containers"] = []
+            text = json.dumps(document, ensure_ascii=False)
+            return text[:MAX_OUTPUT_BYTES]
+
+
+def main() -> int:
+    try:
+        selected = _selection()
+    except ConfigError:
+        json.dump({"version": BUNDLE_VERSION, "error": "config_invalid"}, sys.stdout)
+        sys.stdout.write("\n")
+        return 1
+
+    if not shutil.which("docker"):
+        json.dump({"version": BUNDLE_VERSION, "error": "docker_unavailable"}, sys.stdout)
+        sys.stdout.write("\n")
+        return 1
+
+    collected_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    if collected_at.endswith("+00:00"):
+        collected_at = collected_at[:-6] + "Z"
+
+    containers, truncated, error, selection = _containers_section(selected)
+    document: dict[str, object] = {
+        "version": BUNDLE_VERSION,
+        "collected_at": collected_at,
+        "truncated": truncated,
+        "host": _host_section(),
+        "containers": containers,
+    }
+    if selection is not None:
+        document["selection"] = selection
+    if error:
+        document["error"] = error
+        json.dump(document, sys.stdout)
+        sys.stdout.write("\n")
+        return 1
+
+    sys.stdout.write(_bounded(document))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
